@@ -8,7 +8,9 @@ using Microsoft.IdentityModel.Tokens;
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
-using Microsoft.Extensions.Configuration; // Make sure this is correctly imported
+using Microsoft.Extensions.Configuration;
+using Microsoft.AspNetCore.Identity.Data;
+using E_com.Services.interfaces; // Make sure this is correctly imported
 
 namespace E_com.Controllers
 {
@@ -18,11 +20,13 @@ namespace E_com.Controllers
     {
         private readonly IConfiguration _config;
         private readonly MyDbContext _context;
+        private readonly IEmailService _emailService;
 
-        public LoginController(IConfiguration config, MyDbContext context)
+        public LoginController(IConfiguration config, MyDbContext context, IEmailService emailService)
         {
             _config = config;
             _context = context;
+            _emailService = emailService;
         }
 
         [HttpPost]
@@ -31,10 +35,13 @@ namespace E_com.Controllers
         {
             try
             {
+                if (await _context.Users.AnyAsync(u => u.Email == user.Email))
+                {
+                    return Conflict("Email already exists.");
+                }
+
                 user.Password = BCrypt.Net.BCrypt.HashPassword(user.Password);
                 user.Created_Time = DateTime.Now;
-                user.Created_By = 1; // Consider dynamically setting this based on the logged-in user
-                user.Modified_By = 1; // Consider dynamically setting this based on the logged-in user
                 user.Modified_Time = DateTime.Now;
 
                 _context.Users.Add(user);
@@ -92,5 +99,110 @@ namespace E_com.Controllers
         }
 
 
+
+
+
+        [HttpPost]
+        [Route("ForgotPassword")]
+        public async Task<IActionResult> ForgotPassword([FromBody] ForgotPasswordRequest request)
+        {
+            if (string.IsNullOrEmpty(request.Email))
+            {
+                return BadRequest("Email is required.");
+            }
+
+            var user = await _context.Users.FirstOrDefaultAsync(u => u.Email == request.Email);
+            if (user == null)
+            {
+                // Consider returning Ok here to prevent email enumeration attacks
+                return Ok(new { message = "If a user with this email exists, a password reset link has been sent." });
+            }
+
+            var token = GenerateJwtToken(user.Email!);
+
+            // Generate the reset link
+            // Replace this with your actual client-side URL
+            var clientUrl = _config["ClientUrl:Url"] ?? throw new InvalidOperationException("ClientUrl is not configured.");
+            var resetLink = $"{clientUrl}/ResetPassword?token={Uri.EscapeDataString(token)}";
+
+            // Example email body with the reset link
+            var subject = "Password Reset Request";
+            var body = $@"
+                    <html>
+                        <body>
+                            <p>To reset your password, please click the link below:</p>
+                            <p><a href='{resetLink}'>Reset Password</a></p>
+                            <p>If you didn't request a password reset, please ignore this email.</p>
+                        </body>
+                    </html>";
+
+            // Send the email
+            await _emailService.SendEmailAsync(user.Email!, subject, body);
+
+            return Ok(new { message = "If a user with this email exists, a password reset link has been sent." });
+        }
+
+
+
+        [HttpPost("reset-password")]
+        public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordDto request)
+        {
+            if (!ModelState.IsValid)
+            {
+                return BadRequest(ModelState);
+            }
+
+            if (string.IsNullOrEmpty(request.Token) || string.IsNullOrEmpty(request.NewPassword))
+            {
+                return BadRequest("Token and new password are required.");
+            }
+
+            var email = ValidateToken(request.Token);
+            if (email == null)
+            {
+                return BadRequest("Invalid or expired token.");
+            }
+
+            var user = await _context.Users.FirstOrDefaultAsync(u => u.Email == email);
+            if (user == null)
+            {
+                return NotFound("User not found.");
+            }
+
+            user.Password = BCrypt.Net.BCrypt.HashPassword(request.NewPassword);
+            user.Modified_Time = DateTime.UtcNow;
+            await _context.SaveChangesAsync();
+
+            return Ok(new { message = "Password has been reset successfully." });
+        }
+
+        private string? ValidateToken(string token)
+        {
+            var tokenHandler = new JwtSecurityTokenHandler();
+            var jwtKey = _config["Jwt:Key"] ?? throw new InvalidOperationException("JWT Key is not configured properly.");
+            var key = Encoding.ASCII.GetBytes(jwtKey);
+
+            try
+            {
+                var principal = tokenHandler.ValidateToken(token, new TokenValidationParameters
+                {
+                    ValidateIssuerSigningKey = true,
+                    IssuerSigningKey = new SymmetricSecurityKey(key),
+                    ValidateIssuer = false,
+                    ValidateAudience = false,
+                    ValidateLifetime = false, // Allowing expired tokens for password reset
+                    ClockSkew = TimeSpan.Zero
+                }, out SecurityToken validatedToken);
+
+                return principal.FindFirst(ClaimTypes.Email)?.Value;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
     }
+
+    
 }
